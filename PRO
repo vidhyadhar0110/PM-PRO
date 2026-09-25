@@ -1,0 +1,50 @@
+CREATE or replace VIEW pressganey_db.vw_oas_cerner_pending AS
+WITH cerner_cpt AS (
+    SELECT
+        p.encntr_id,
+        n.SOURCE_IDENTIFIER AS procedure_code,
+        p.PROC_PRIORITY,
+        ROW_NUMBER() OVER (PARTITION BY p.encntr_id ORDER BY p.PROC_PRIORITY) AS rn
+    FROM prod.cerner_db.procedure p
+    JOIN prod.cerner_db.NOMENCLATURE n ON p.NOMENCLATURE_ID = n.NOMENCLATURE_ID
+    WHERE p.CONTRIBUTOR_SYSTEM_CD = 725584475 --ENTERPRISE_CODING
+      AND n.SOURCE_VOCABULARY_CD = 1217 --CPT4
+      AND p.ACTIVE_IND = 1
+      AND n.ACTIVE_IND = 1
+),
+cerner_cpt_driver AS (
+    SELECT
+        p.encntr_id,
+        MAX(p.UPDT_DT_TM) AS cpt_updt_dt_tm
+    FROM prod.cerner_db.procedure p
+    JOIN prod.cerner_db.NOMENCLATURE n ON p.NOMENCLATURE_ID = n.NOMENCLATURE_ID
+    WHERE p.CONTRIBUTOR_SYSTEM_CD = 725584475
+      AND n.SOURCE_VOCABULARY_CD = 1217
+      AND p.ACTIVE_IND = 1
+      AND n.ACTIVE_IND = 1
+    GROUP BY p.encntr_id
+)
+SELECT DISTINCT 'AS0101'::character varying AS survey_designator, CASE WHEN (vpd.organization_id = 657844) THEN 6653 WHEN (vpd.organization_id = 657849) THEN 6658 WHEN (vpd.organization_id = 2968747) THEN 1183 ELSE NULL::integer END AS client_id, vpd.name_last AS last_name, vpd.name_middle AS middle_initial, vpd.name_first AS first_name, vpd.street_addr AS address_1, vpd.street_addr2 AS address_2, vpd.city, vpd.state, vpd.zip_code, vpd.phone_number AS telephonenumber, vpd.mobile_number, CASE WHEN (fc.drg_type IS NULL) THEN 'MS-DRG'::character varying ELSE fc.drg_type END AS "ms-drg",
+CASE WHEN ((SELECT count(1) AS count FROM pressganey_db.cerner_pg_lookup WHERE (((cerner_pg_lookup.pg_cv_type)::text = ('GENDER'::character varying)::text) AND (cerner_pg_lookup.cerner_cv = vpd.gender_cd))) = 1)
+THEN (SELECT cerner_pg_lookup.pg_cv FROM pressganey_db.cerner_pg_lookup WHERE (((cerner_pg_lookup.pg_cv_type)::text = ('GENDER'::character varying)::text) AND (cerner_pg_lookup.cerner_cv = vpd.gender_cd)))
+ELSE 'M'::character varying END AS birth_sex,
+vpd.birth_sex AS gender,
+vpd.race, vpd.ethnicity, vpd.date_of_birth, (SELECT cerner_pg_lookup.pg_cv FROM pressganey_db.cerner_pg_lookup WHERE (((cerner_pg_lookup.pg_cv_type)::text = ('LANGUAGE'::character varying)::text) AND ((((cerner_pg_lookup.cerner_cv)::character varying)::text = vpd.language_cd) OR ((cerner_pg_lookup.cerner_desc)::text = vpd."language")))) AS "language", vpd.mrn AS medical_recored_number, vpd.fin AS unique_id, vpd.location_cd AS location_code, vpd.location_description AS location_name, (SELECT dp.provider_npi FROM provider_cds.dim_provider dp WHERE (dp.provider_person_id = vpd.attend_physician_id)) AS att_provider_npi, (SELECT dp.provider_name_full_formatted FROM provider_cds.dim_provider dp WHERE (dp.provider_person_id = vpd.attend_physician_id)) AS att_provider_name, (SELECT cerner_pg_lookup.pg_cv FROM pressganey_db.cerner_pg_lookup WHERE (((cerner_pg_lookup.pg_cv_type)::text = ('ADMISSION'::character varying)::text) AND (((cerner_pg_lookup.cerner_cv)::character varying)::text = vpd.admit_src_cd))) AS patient_admission_source, vpd.admit_date AS visit_or_admit_date, vpd.admit_time AS visit_or_admit_time, vpd.discharge_date, vpd.discharge_time, (SELECT cerner_pg_lookup.pg_cv FROM pressganey_db.cerner_pg_lookup WHERE (((cerner_pg_lookup.pg_cv_type)::text = ('DISCHARGE'::character varying)::text) AND (((cerner_pg_lookup.cerner_cv)::character varying)::text = vpd.disch_disposition_cd))) AS patient_discharge_status, vpd.loc_nurse_unit AS unit, vpd.med_service AS service, (SELECT dp2.provider_specialty FROM provider_cds.dim_provider dp2 WHERE (dp2.provider_person_id = vpd.attend_physician_id)) AS specialty, vpd.payor_class AS payor_insurance_financial_class, CASE WHEN (date_diff(('days'::character varying)::text, (to_date(vpd.admit_date, ('MMDDYYYY'::character varying)::text))::timestamp without time zone, (to_date(vpd.discharge_date, ('MMDDYYYY'::character varying)::text))::timestamp without time zone) = 0) THEN (1)::bigint ELSE date_diff(('days'::character varying)::text, (to_date(vpd.admit_date, ('MMDDYYYY'::character varying)::text))::timestamp without time zone, (to_date(vpd.discharge_date, ('MMDDYYYY'::character varying)::text))::timestamp without time zone) END AS length_of_stay, vpd.loc_room AS room, vpd.loc_bed AS bed, ''::character varying AS hospitalist, ''::character varying AS fast_track_or_acute_flag, vpd.email, ''::character varying AS hospitalist_1, ''::character varying AS hospitalist_2, ''::character varying AS er_admit, (SELECT "replace"((fd.diagnosis_code)::text, ('.'::character varying)::text, (''::character varying)::text) AS "replace" FROM clinical_cds.fact_diagnosis fd WHERE (((fd.fin)::text = (vpd.fin)::text) AND (fd.encntr_id = vpd.encntr_id))) AS primary_diagnosis,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 1)) AS procedure_code_1,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 2)) AS procedure_code_2,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 3)) AS procedure_code_3,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 4)) AS procedure_code_4,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 5)) AS procedure_code_5,
+(SELECT cc.procedure_code FROM cerner_cpt cc WHERE (cc.encntr_id = vpd.encntr_id AND cc.rn = 6)) AS procedure_code_6,
+COALESCE(dpio.value_description, 'N'::character varying) AS no_publicity_flag, CASE WHEN (vpd.deceased = ('Yes'::character varying)::text) THEN 'Y'::character varying ELSE 'N'::character varying END AS deceased_flag, CASE WHEN ((((((((((fc.disch_disposition_cd = 18738276) OR (fc.disch_disposition_cd = 312906)) OR (fc.disch_disposition_cd = 685144)) OR (fc.disch_disposition_cd = 732363177)) OR (fc.disch_disposition_cd = 638677)) OR (fc.disch_disposition_cd = 4510195)) OR (fc.disch_disposition_cd = 732363263)) OR (fc.disch_disposition_cd = 4190898)) OR (fc.disch_disposition_cd = 4225260)) OR (fc.disch_disposition_cd = 732363557)) THEN 'Y'::character varying ELSE 'N'::character varying END AS "transferred/admitted_to_inpatient", vpd.admitted_to_inpatient_fl AS transferred_admitted_to_inpatient, dp.provider_npi AS anesthesiologist_npi, sc.primary_anesthesiologist AS anesthesiologist_name, sc.surg_case_id AS case_number, dp1.provider_specialty AS att_provider_specialty, sc.surg_or_location AS or_location, sc.primary_surgeon AS surgeon_name, sc.primary_surgeon_id AS surgeon_npi, vpd.religion,coalesce(mdp.homedepartment:: TEXT, '') AS att_provider_dept,
+    coalesce(mdp.homedivision:: TEXT, '') AS att_provider_division, '$'::character varying AS eor_indicator, sc.surg_start_dt_tm,
+    ccd.cpt_updt_dt_tm
+FROM ((((pressganey_db.vw_patient_demographics_vs vpd
+LEFT JOIN clinical_db.surgical_case sc ON (((sc.encntr_id = vpd.encntr_id) AND (sc.person_id = vpd.person_id))))
+LEFT JOIN patient_cds.dim_patient_info_option dpio ON (((dpio.person_id = vpd.person_id) AND (lower((dpio.info_sub_description)::text) ~ ('%survey%'::character varying)::text))))
+LEFT JOIN provider_cds.dim_provider dp ON ((((dp.provider_person_id)::character varying)::text = (sc.anesth_prsnl_id)::text)))
+LEFT JOIN clinical_cds.fact_encounter fc ON (((fc.encntr_id = vpd.encntr_id) AND (fc.attend_physician_id = dp.provider_person_id)))
+left join provider_cds.dim_provider dp1 ON dp1.provider_person_id = vpd.attend_physician_id
+left join mars_db.dim_provider mdp ON mdp.npinumber = dp1.provider_npi)
+left join cerner_cpt_driver ccd ON ccd.encntr_id = vpd.encntr_id
+WHERE (((vpd.encntr_type_cd = 309311) OR (vpd.encntr_type_cd = 309309)) OR (vpd.encntr_type_cd = 195302052)) with no schema binding;

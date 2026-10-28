@@ -1,0 +1,44 @@
+SELECT distinct
+   ops.encounter_id,
+   ops.encounter_mrn,
+   mde.FINANCIAL_NUMBER as unique_id,
+   ops.surgical_op_location_code,
+   ops.surgical_op_location_display,
+   ops.surgery_start_dt_tm,
+   mde.encounter_organization_name,
+   mde.encounter_organization_id,
+   mde.los,
+   mdp.FULL_NAME,
+   mdp.GIVEN_NAME1 as first_name,
+   mdp.GIVEN_NAME2 as MIDDLE_INITIAL,
+   mdp.FAMILY_NAME1 as last_name,
+   pa.alias as att_npi,
+   prsnl.prsnl_name as att_name,
+   mdstaff.SPECIALTY,
+   mdp.address_line_1 as address_1,
+   mdp.ADDRESS_LINE_2 as address_2,
+   mdp.CITY,
+   mdp.STATE_RAW_DISPLAY as state,
+   mdp.POSTAL_CODE as zip,
+   mdp.PHONE_NUMBER,
+   mdp.BIRTH_SEX_RAW_DISPLAY,
+   mdp.RACE_RAW_DISPLAY,
+   mdp.ETHNICITY_RAW_DISPLAY,
+   mdp.BIRTH_DT_TM,
+   mdp.LANGUAGE_RAW_DISPLAY,
+   mde.DISCHARGE_DATE
+   
+FROM KECKMEDICINE_EDW_MILL_CDS.SURG_F_OPS ops
+INNER JOIN KECKMEDICINE_EDW_MILL_CDS_SSA.MD_F_ENCOUNTER mde
+   ON ops.encounter_id = mde.encounter_id
+   left join	KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSON mdp on ops.PERSON_ID=mdp.PERSON_ID 
+   left join KECKMEDICINE_EDW_MILL_CDS.MD_F_ENCOUNTER_PERSONNEL_RELTN prsnl on mde.ENCOUNTER_ID=prsnl.encounter_id and prsnl.relationship_type_raw_code =1119 and prsnl.END_EFFECTIVE_DT_TM>CURRENT_TIMESTAMP()---att_providerALTER
+   left join KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSONNEL_ALIAS pa on pa.PERSON_ID=prsnl.prsnl_id and pa.PRSNL_ALIAS_TYPE_RAW_DISPLAY='National Provider Identifier' and pa.ACTIVE_IND=1
+   left join KECKMEDICINE_EDW_ANALYST_DEV.USC_MDSTAFF_PROVIDER_CREDENTIALS mdstaff on mdstaff.NPI = pa.alias 
+   
+WHERE mde.ENCOUNTER_TYPE_RAW_CODE IN (309311, 309309, 195302052) and ENCOUNTER_ORGANIZATION_ID = '657844'
+ AND ops.surgery_start_dt_tm >= DATEADD(day, -2, CURRENT_DATE())
+ AND ops.surgery_start_dt_tm <  CURRENT_DATE()
+ and ops.SURGERY_COMPLETE_QUANTITY=1  -----completed surgies only;
+ and ops.cancellation_reason_code = 0
+ and ops.encounter_id=89000010

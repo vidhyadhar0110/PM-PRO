@@ -1,3 +1,41 @@
+--keck
+ WITH cerner_cpt AS (
+    SELECT
+        p.encntr_id,
+        n.SOURCE_IDENTIFIER AS procedure_code,
+        p.PROC_PRIORITY,
+        ROW_NUMBER() OVER (PARTITION BY p.encntr_id ORDER BY p.PROC_PRIORITY) AS rn
+    FROM KECKMEDICINE_P186.procedure p
+    JOIN KECKMEDICINE_P186.cerner_db.NOMENCLATURE n ON p.NOMENCLATURE_ID = n.NOMENCLATURE_ID
+    WHERE p.CONTRIBUTOR_SYSTEM_CD = 725584475 --ENTERPRISE_CODING
+      AND n.SOURCE_VOCABULARY_CD = 1217 --CPT4
+      AND p.ACTIVE_IND = 1
+      AND n.ACTIVE_IND = 1
+),
+cerner_cpt_driver AS (
+    SELECT
+        p.encntr_id,
+        MAX(p.UPDT_DT_TM) AS cpt_updt_dt_tm
+    FROM KECKMEDICINE_P186.cerner_db.procedure p
+    JOIN KECKMEDICINE_P186.cerner_db.NOMENCLATURE n ON p.NOMENCLATURE_ID = n.NOMENCLATURE_ID
+    WHERE p.CONTRIBUTOR_SYSTEM_CD = 725584475
+      AND n.SOURCE_VOCABULARY_CD = 1217
+      AND p.ACTIVE_IND = 1
+      AND n.ACTIVE_IND = 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 SELECT distinct
    ops.encounter_id,
    ops.encounter_mrn,

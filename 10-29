@@ -1,0 +1,124 @@
+WITH cerner_cpt AS (
+    SELECT
+        p.encntr_id,
+        n.source_identifier AS procedure_code,
+        p.proc_priority,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.encntr_id
+            ORDER BY p.proc_priority, p.procedure_id
+        ) AS rn
+    FROM KECKMEDICINE_P186.procedure p
+    JOIN KECKMEDICINE_P186.nomenclature n
+      ON p.nomenclature_id = n.nomenclature_id
+    WHERE p.contributor_system_cd = 725584475   -- ENTERPRISE_CODING
+      AND n.source_vocabulary_cd  = 1217        -- CPT4
+      AND p.active_ind = 1
+      AND n.active_ind = 1
+),
+cerner_cpt_agg AS (
+    SELECT
+        encntr_id,
+        MAX(CASE WHEN rn = 1 THEN procedure_code END) AS cpt_1,
+        MAX(CASE WHEN rn = 2 THEN procedure_code END) AS cpt_2,
+        MAX(CASE WHEN rn = 3 THEN procedure_code END) AS cpt_3,
+        MAX(CASE WHEN rn = 4 THEN procedure_code END) AS cpt_4,
+        MAX(CASE WHEN rn = 5 THEN procedure_code END) AS cpt_5,
+        MAX(CASE WHEN rn = 6 THEN procedure_code END) AS cpt_6
+    FROM cerner_cpt
+    WHERE rn <= 6
+    GROUP BY encntr_id
+),
+cerner_cpt_driver AS (
+    SELECT
+        p.encntr_id,
+        MAX(p.updt_dt_tm) AS cpt_updt_dt_tm
+    FROM KECKMEDICINE_P186.procedure p
+    JOIN KECKMEDICINE_P186.nomenclature n
+      ON p.nomenclature_id = n.nomenclature_id
+    WHERE p.contributor_system_cd = 725584475
+      AND n.source_vocabulary_cd  = 1217
+      AND p.active_ind = 1
+      AND n.active_ind = 1
+    GROUP BY p.encntr_id
+)
+SELECT DISTINCT
+    ops.encounter_id,
+    ops.encounter_mrn,
+    mde.financial_number              AS unique_id,
+    ops.surgical_op_location_code,
+    ops.surgical_op_location_display,
+    ops.surgery_start_dt_tm,
+    mde.encounter_organization_name,
+    mde.encounter_organization_id,
+    mde.los as length_of_stay,
+    mdp.full_name,
+    mdp.given_name1                   AS first_name,
+    mdp.given_name2                   AS middle_initial,
+    mdp.family_name1                  AS last_name,
+    mde.ACTUAL_ARRIVAL_DATE as visit_or_admit_date,
+    mde.ACTUAL_ARRIVAL_DT_TM as visit_or_admit_time,
+    mde.FINANCIAL_CLASS_RAW_DISPLAY as payor_insurance_financial_class,
+    mde.HOSPITAL_SERVICE_RAW_DISPLAY as service,
+    pa.alias                          AS att_npi,
+    prsnl.prsnl_name                  AS att_name,
+    mdstaff.specialty,
+    mdp.address_line_1                AS address_1,
+    mdp.address_line_2                AS address_2,
+    mdp.email_address as email,
+    mdp.city,
+    mdp.state_raw_display             AS state,
+    mdp.postal_code                   AS zip,
+    mdp.phone_number,
+    mdp.birth_sex_raw_display,
+    mdp.GENDER_RAW_DISPLAY as gender,
+    mdp.RELIGION_RAW_DISPLAY as religion,
+    mde.ROOM_DISPLAY as room,
+    mde.BED_DISPLAY as  bed,
+    mde.ADMISSION_SOURCE_RAW_DISPLAY as patient_admission_source,
+    mdp.race_raw_display,
+    mdp.ethnicity_raw_display,
+    mdp.birth_dt_tm,
+    mdp.language_raw_display,
+    mde.discharge_date as discharge_date,
+    mde.DISCHARGE_DT_TM as discharge_time,
+    mde.STATUS_RAW_DISPLAY as patient_discharge_status,
+    cpt.cpt_1,
+    cpt.cpt_2,
+    cpt.cpt_3,
+    cpt.cpt_4,
+    cpt.cpt_5,
+    cpt.cpt_6,
+    drv.cpt_updt_dt_tm,
+    ops.SURGICAL_CASE_ID as case_number,
+    ops.ANESTHESIOLOGIST_OF_RECORD as anesthesiologist_name,
+    ops.SURGEON_NAME,
+    ops.SURGEON_NPI,
+    drg.ms_drg_source_identifier as ms_drg
+FROM KECKMEDICINE_EDW_MILL_CDS.SURG_F_OPS ops
+INNER JOIN KECKMEDICINE_EDW_MILL_CDS_SSA.MD_F_ENCOUNTER mde
+    ON ops.encounter_id = mde.encounter_id
+LEFT JOIN KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSON mdp
+    ON ops.person_id = mdp.person_id
+LEFT JOIN KECKMEDICINE_EDW_MILL_CDS.MD_F_ENCOUNTER_PERSONNEL_RELTN prsnl
+    ON mde.encounter_id = prsnl.encounter_id
+   AND prsnl.relationship_type_raw_code = 1119          -- attending
+   AND prsnl.end_effective_dt_tm > CURRENT_TIMESTAMP()
+LEFT JOIN KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSONNEL_ALIAS pa
+    ON pa.person_id = prsnl.prsnl_id
+   AND pa.prsnl_alias_type_raw_display = 'National Provider Identifier'
+   AND pa.active_ind = 1
+LEFT JOIN KECKMEDICINE_EDW_ANALYST_DEV.USC_MDSTAFF_PROVIDER_CREDENTIALS mdstaff
+    ON mdstaff.npi = pa.alias
+LEFT JOIN cerner_cpt_agg cpt
+    ON cpt.encntr_id = ops.encounter_id
+LEFT JOIN cerner_cpt_driver drv
+    ON drv.encntr_id = ops.encounter_id
+    left join KECKMEDICINE_EDW_MILL_CDS_SSA.USC_SSA_MS_DRG drg 
+               on drg.ENCNTR_ID=mde.ENCOUNTER_ID
+WHERE mde.encounter_type_raw_code IN (309311, 309309, 195302052)
+  AND mde.encounter_organization_id = '657844'
+  AND ops.surgery_start_dt_tm >= DATEADD(day, -2, CURRENT_DATE())
+  AND ops.surgery_start_dt_tm <  CURRENT_DATE()
+  AND ops.surgery_complete_quantity = 1       -- completed surgeries only
+  AND ops.cancellation_reason_code = 0
+  AND ops.encounter_id = 89000010;  

@@ -1,0 +1,282 @@
+--keck
+WITH params AS (
+    SELECT
+        '657844'                          AS org_id,
+        DATEADD(day, -2, CURRENT_DATE())  AS start_dt,
+        CURRENT_DATE()                    AS end_dt,
+        89000010                          AS test_encounter_id   -- set to NULL for full run
+),
+
+-- 1. Surgical encounters in scope (one row per encounter: first completed case)
+surg_scope AS (
+    SELECT
+        ops.encounter_id,
+        ops.encounter_mrn,
+        ops.person_id,
+        ops.surgical_case_id,
+        ops.surgical_op_location_code,
+        ops.surgical_op_location_display,
+        ops.surgery_start_dt_tm,
+        ops.anesthesiologist_of_record,
+        ops.surgeon_name,
+        ops.surgeon_npi,
+        mde.financial_number,
+        mde.encounter_organization_name,
+        mde.encounter_organization_id,
+        mde.los,
+        mde.actual_arrival_date,
+        mde.actual_arrival_dt_tm,
+        mde.financial_class_raw_display,
+        mde.hospital_service_raw_display,
+        mde.room_display,
+        mde.bed_display,
+        mde.admission_source_raw_display,
+        mde.discharge_date,
+        mde.discharge_dt_tm,
+        mde.status_raw_display
+    FROM KECKMEDICINE_EDW_MILL_CDS.SURG_F_OPS ops
+    INNER JOIN KECKMEDICINE_EDW_MILL_CDS_SSA.MD_F_ENCOUNTER mde
+        ON ops.encounter_id = mde.encounter_id
+    CROSS JOIN params prm
+    WHERE mde.encounter_type_raw_code IN (309311, 309309, 195302052)
+      AND mde.encounter_organization_id = prm.org_id
+      AND ops.surgery_start_dt_tm >= prm.start_dt
+      AND ops.surgery_start_dt_tm <  prm.end_dt
+      AND ops.surgery_complete_quantity = 1        -- completed surgeries only
+      AND ops.cancellation_reason_code = 0
+      AND (prm.test_encounter_id IS NULL OR ops.encounter_id = prm.test_encounter_id)
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ops.encounter_id
+                ORDER BY ops.surgery_start_dt_tm, ops.surgical_case_id
+            ) = 1
+),
+
+-- 2. CPT codes: only for in-scope encounters, de-duplicated per code
+cpt_dedup AS (
+    SELECT
+        p.encntr_id,
+        TRIM(n.source_identifier)   AS procedure_code,
+        MIN(p.proc_priority)        AS proc_priority,
+        MIN(p.procedure_id)         AS first_procedure_id,
+        MAX(p.updt_dt_tm)           AS updt_dt_tm
+    FROM KECKMEDICINE_P186.procedure p
+    JOIN KECKMEDICINE_P186.nomenclature n
+      ON p.nomenclature_id = n.nomenclature_id
+    WHERE p.contributor_system_cd = 725584475   -- ENTERPRISE_CODING
+      AND n.source_vocabulary_cd  = 1217        -- CPT4
+      AND p.active_ind = 1
+      AND n.active_ind = 1
+      AND p.encntr_id IN (SELECT encounter_id FROM surg_scope)
+    GROUP BY p.encntr_id, TRIM(n.source_identifier)
+),
+
+-- 3. Pivot top 6 CPTs + count + last coding update
+cpt_pivot AS (
+    SELECT
+        encntr_id,
+        MAX(CASE WHEN rn = 1 THEN procedure_code END) AS cpt_1,
+        MAX(CASE WHEN rn = 2 THEN procedure_code END) AS cpt_2,
+        MAX(CASE WHEN rn = 3 THEN procedure_code END) AS cpt_3,
+        MAX(CASE WHEN rn = 4 THEN procedure_code END) AS cpt_4,
+        MAX(CASE WHEN rn = 5 THEN procedure_code END) AS cpt_5,
+        MAX(CASE WHEN rn = 6 THEN procedure_code END) AS cpt_6,
+        COUNT(*)                                      AS cpt_count,
+        MAX(updt_dt_tm)                               AS cpt_updt_dt_tm
+    FROM (
+        SELECT
+            d.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY encntr_id
+                ORDER BY proc_priority NULLS LAST, first_procedure_id
+            ) AS rn
+        FROM cpt_dedup d
+    )
+    GROUP BY encntr_id
+),
+
+-- 4. MS-DRG: one per encounter
+drg AS (
+    SELECT
+        d.encntr_id,
+        d.ms_drg_source_identifier
+    FROM KECKMEDICINE_EDW_MILL_CDS_SSA.USC_SSA_MS_DRG d
+    WHERE d.encntr_id IN (SELECT encounter_id FROM surg_scope)
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY d.encntr_id
+                ORDER BY d.ms_drg_source_identifier
+            ) = 1
+),
+
+/* ===================== ATTENDING ===================== */
+
+-- 5. One current attending per encounter
+attending AS (
+    SELECT
+        prsnl.encounter_id,
+        prsnl.prsnl_id,
+        prsnl.prsnl_name
+    FROM KECKMEDICINE_EDW_MILL_CDS.MD_F_ENCOUNTER_PERSONNEL_RELTN prsnl
+    WHERE prsnl.encounter_id IN (SELECT encounter_id FROM surg_scope)
+      AND prsnl.relationship_type_raw_code = 1119       -- attending
+      AND prsnl.end_effective_dt_tm > CURRENT_TIMESTAMP()
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY prsnl.encounter_id
+                ORDER BY prsnl.beg_effective_dt_tm DESC
+            ) = 1
+),
+
+-- 6. Attending NPI
+att_npi AS (
+    SELECT
+        pa.person_id,
+        pa.alias AS att_npi
+    FROM KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSONNEL_ALIAS pa
+    WHERE pa.person_id IN (SELECT prsnl_id FROM attending)
+      AND pa.prsnl_alias_type_raw_display = 'National Provider Identifier'
+      AND pa.active_ind = 1
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY pa.person_id ORDER BY pa.alias) = 1
+),
+
+-- 7. Attending specialty (MDStaff)
+att_mdstaff AS (
+    SELECT
+        m.npi       AS att_npi,
+        m.specialty AS att_specialty
+    FROM KECKMEDICINE_EDW_ANALYST_DEV.USC_MDSTAFF_PROVIDER_CREDENTIALS m
+    WHERE m.npi IN (SELECT att_npi FROM att_npi)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY m.npi ORDER BY m.specialty) = 1
+),
+
+-- 8. Attending division / department (MARS)
+att_mars AS (
+    SELECT
+        mp.npi        AS att_npi,           -- verify column name
+        mp.division   AS att_division,      -- verify column name
+        mp.department AS att_department     -- verify column name
+    FROM KECKMEDICINE_EDW_ANALYST_DEV.USC_MARS_DIM_PROVIDER mp
+    WHERE mp.npi IN (SELECT att_npi FROM att_npi)
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY mp.npi
+                ORDER BY mp.department, mp.division
+            ) = 1
+),
+
+/* ===================== SURGEON ===================== */
+
+-- 9. Surgeon specialty (MDStaff)
+surg_mdstaff AS (
+    SELECT
+        m.npi       AS surgeon_npi,
+        m.specialty AS surgeon_specialty
+    FROM KECKMEDICINE_EDW_ANALYST_DEV.USC_MDSTAFF_PROVIDER_CREDENTIALS m
+    WHERE m.npi IN (SELECT surgeon_npi FROM surg_scope)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY m.npi ORDER BY m.specialty) = 1
+),
+
+-- 10. Surgeon division / department (MARS)
+surg_mars AS (
+    SELECT
+        mp.npi        AS surgeon_npi,           -- verify column name
+        mp.division   AS surgeon_division,      -- verify column name
+        mp.department AS surgeon_department     -- verify column name
+    FROM KECKMEDICINE_EDW_ANALYST_DEV.USC_MARS_DIM_PROVIDER mp
+    WHERE mp.npi IN (SELECT surgeon_npi FROM surg_scope)
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY mp.npi
+                ORDER BY mp.department, mp.division
+            ) = 1
+)
+
+SELECT
+    -- Encounter / visit
+    s.encounter_id,
+    s.encounter_mrn,
+    s.financial_number                  AS unique_id,
+    s.encounter_organization_name,
+    s.encounter_organization_id,
+    s.actual_arrival_date               AS visit_or_admit_date,
+    s.actual_arrival_dt_tm              AS visit_or_admit_time,
+    s.discharge_date,
+    s.discharge_dt_tm                   AS discharge_time,
+    s.los                               AS length_of_stay,
+    s.status_raw_display                AS patient_discharge_status,
+    s.admission_source_raw_display      AS patient_admission_source,
+    s.financial_class_raw_display       AS payor_insurance_financial_class,
+    s.hospital_service_raw_display      AS service,
+    s.room_display                      AS room,
+    s.bed_display                       AS bed,
+    drg.ms_drg_source_identifier        AS ms_drg,
+
+    -- Surgery
+    s.surgical_case_id                  AS case_number,
+    s.surgical_op_location_code,
+    s.surgical_op_location_display,
+    s.surgery_start_dt_tm,
+    s.anesthesiologist_of_record        AS anesthesiologist_name,
+
+    -- Surgeon
+    s.surgeon_name,
+    s.surgeon_npi,
+    sms.surgeon_specialty,
+    smr.surgeon_division,
+    smr.surgeon_department,
+
+    -- Attending
+    att.prsnl_name                      AS att_name,
+    anpi.att_npi,
+    ams.att_specialty,
+    amr.att_division,
+    amr.att_department,
+
+    -- Patient
+    mdp.full_name,
+    mdp.given_name1                     AS first_name,
+    mdp.given_name2                     AS middle_initial,
+    mdp.family_name1                    AS last_name,
+    mdp.birth_dt_tm,
+    mdp.birth_sex_raw_display,
+    mdp.gender_raw_display              AS gender,
+    mdp.race_raw_display,
+    mdp.ethnicity_raw_display,
+    mdp.religion_raw_display            AS religion,
+    mdp.language_raw_display,
+    mdp.address_line_1                  AS address_1,
+    mdp.address_line_2                  AS address_2,
+    mdp.city,
+    mdp.state_raw_display               AS state,
+    mdp.postal_code                     AS zip,
+    mdp.phone_number,
+    mdp.email_address                   AS email,
+
+    -- CPT
+    cpt.cpt_1,
+    cpt.cpt_2,
+    cpt.cpt_3,
+    cpt.cpt_4,
+    cpt.cpt_5,
+    cpt.cpt_6,
+    COALESCE(cpt.cpt_count, 0)          AS cpt_count,
+    cpt.cpt_updt_dt_tm
+FROM surg_scope s
+LEFT JOIN KECKMEDICINE_EDW_MILL_CDS.MD_D_PERSON mdp
+    ON s.person_id = mdp.person_id
+-- attending chain
+LEFT JOIN attending att
+    ON att.encounter_id = s.encounter_id
+LEFT JOIN att_npi anpi
+    ON anpi.person_id = att.prsnl_id
+LEFT JOIN att_mdstaff ams
+    ON ams.att_npi = anpi.att_npi
+LEFT JOIN att_mars amr
+    ON amr.att_npi = anpi.att_npi
+-- surgeon chain
+LEFT JOIN surg_mdstaff sms
+    ON sms.surgeon_npi = s.surgeon_npi
+LEFT JOIN surg_mars smr
+    ON smr.surgeon_npi = s.surgeon_npi
+-- coding
+LEFT JOIN cpt_pivot cpt
+    ON cpt.encntr_id = s.encounter_id
+LEFT JOIN drg
+    ON drg.encntr_id = s.encounter_id
+ORDER BY s.surgery_start_dt_tm, s.encounter_id;
